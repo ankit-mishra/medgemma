@@ -1,0 +1,783 @@
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Callable responsible for running Inference on provided patches."""
+from __future__ import annotations
+
+import base64
+import concurrent.futures
+import contextlib
+import dataclasses
+import functools
+import json
+import time
+import typing
+from typing import Any, Callable, Mapping, Optional, Sequence, Union
+import uuid
+
+import cv2
+import jsonschema
+import numpy as np
+
+from data_accessors import abstract_data_accessor
+from data_accessors import data_accessor_errors
+from data_accessors.dicom_generic import data_accessor as dicom_generic_data_accessor
+from data_accessors.dicom_generic import data_accessor_definition as dicom_generic_data_accessor_definition
+from data_accessors.dicom_wsi import configuration as dicom_wsi_configuration
+from data_accessors.dicom_wsi import data_accessor as dicom_wsi_data_accessor
+from data_accessors.dicom_wsi import data_accessor_definition as dicom_wsi_data_accessor_definition
+from data_accessors.gcs_generic import data_accessor as gcs_generic_data_accessor
+from data_accessors.gcs_generic import data_accessor_definition as gcs_generic_data_accessor_definition
+from data_accessors.http_image import data_accessor as http_image_data_accessor
+from data_accessors.http_image import data_accessor_definition as http_image_data_accessor_definition
+from data_accessors.inline_bytes import data_accessor as inline_bytes_data_accessor
+from data_accessors.inline_bytes import data_accessor_definition as inline_bytes_data_accessor_definition
+from data_accessors.inline_text import data_accessor as inline_text_data_accessor
+from data_accessors.inline_text import data_accessor_definition as inline_text_data_accessor_definition
+from data_accessors.local_file_handlers import generic_dicom_handler
+from data_accessors.local_file_handlers import openslide_handler
+from data_accessors.local_file_handlers import traditional_image_handler
+from data_accessors.local_file_handlers import wsi_dicom_handler
+from data_accessors.utils import authentication_utils
+from data_accessors.utils import dicom_source_utils
+from data_accessors.utils import json_validation_utils
+from serving.serving_framework import model_runner
+from serving import flags
+from serving import predictor_const
+from serving.logging_lib import cloud_logging_client
+
+
+INSTANCES_KEY = 'instances'
+PREDICTIONS_KEY = 'predictions'
+
+
+class _InlineTextInstance(inline_text_data_accessor_definition.InlineText):
+
+  def __init__(self, **kwargs):
+    super().__init__(**kwargs)
+    # text does not have patch coordinates but adding to enable text accessor
+    # to be used identically with image accessors.
+    self.patch_coordinates = []
+
+
+_EmbeddingInstance = Union[
+    dicom_wsi_data_accessor_definition.DicomWSIImage,
+    dicom_generic_data_accessor_definition.DicomGenericImage,
+    gcs_generic_data_accessor_definition.GcsGenericBlob,
+    inline_bytes_data_accessor_definition.InlineBytes,
+    _InlineTextInstance,
+    http_image_data_accessor_definition.HttpImage,
+]
+
+
+_LOCAL_FILE_HANDLERS = [
+    generic_dicom_handler.GenericDicomHandler(),
+    traditional_image_handler.TraditionalImageHandler(),
+    openslide_handler.OpenSlideHandler(),
+    wsi_dicom_handler.WsiDicomHandler(),
+]
+
+# endpoint configurations.
+_GCS_DOWNLOAD_THREAD_COUNT = int(2)
+_MAX_ERROR_DESCRIPTION_LENGTH = 1024
+
+# Default value for max_tokens.
+_DEFAULT_MAX_TOKENS = 500
+
+
+def _cast_and_validate_bool(val: Any) -> bool:
+  """Converts a value to bool or returns val as is."""
+  if isinstance(val, bool):
+    return val
+  if isinstance(val, int) or isinstance(val, float):
+    return bool(val)
+  if not isinstance(val, str):
+    raise json_validation_utils.ValidationError('not bool')
+  val = val.strip().lower()
+  if val in ('y', 'yes', 't', 'true', 'on', '1'):
+    return True
+  if val in ('n', 'no', 'f', 'false', 'off', '0'):
+    return False
+  raise json_validation_utils.ValidationError('not bool')
+
+
+def _parse_image_content(
+    config: dicom_wsi_configuration.ConfigurationSettings,
+    instance: Mapping[str, Any],
+) -> abstract_data_accessor.AbstractDataAccessor[
+    _EmbeddingInstance, np.ndarray
+]:
+  """Parses image instance request from json."""
+  if not isinstance(instance, dict):
+    raise data_accessor_errors.InvalidRequestFieldError(
+        'Request image instance is not a dict.'
+    )
+  if instance[predictor_const.INPUT_TYPE] == predictor_const.IMAGE_TYPE_BYTES:
+    parsed_instance = (
+        inline_bytes_data_accessor_definition.json_to_generic_bytes(
+            instance[predictor_const.IMAGE_TYPE_BYTES],
+            config.endpoint_input_width,
+            config.endpoint_input_height,
+            False,  # Require patch dim match default dim.
+        )
+    )
+    return inline_bytes_data_accessor.InlineBytesData(
+        parsed_instance, _LOCAL_FILE_HANDLERS
+    )
+  # support HTTP data source.
+  if instance[predictor_const.INPUT_TYPE] == predictor_const.IMAGE_TYPE_URL:
+    http_record = instance[predictor_const.IMAGE_TYPE_URL]
+    parsed_instance = http_image_data_accessor_definition.json_to_http_image(
+        authentication_utils.create_auth_from_instance(
+            http_record.get(predictor_const.BEARER_TOKEN, '')
+        ),
+        http_record,
+        config.endpoint_input_width,
+        config.endpoint_input_height,
+        False,  # Require patch dim match default dim.
+    )
+    return http_image_data_accessor.HttpImageData(
+        parsed_instance, _LOCAL_FILE_HANDLERS
+    )
+  # support GCS and DICOM.
+  if instance[predictor_const.INPUT_TYPE] == predictor_const.IMAGE_TYPE_GCS:
+    gcs_record = instance[predictor_const.IMAGE_TYPE_GCS]
+    parsed_instance = (
+        gcs_generic_data_accessor_definition.json_to_generic_gcs_image(
+            authentication_utils.create_auth_from_instance(
+                gcs_record.get(predictor_const.BEARER_TOKEN, '')
+            ),
+            gcs_record,
+            config.endpoint_input_width,
+            config.endpoint_input_height,
+            False,  # Require patch dim match default dim.
+        )
+    )
+    return gcs_generic_data_accessor.GcsGenericData(
+        parsed_instance,
+        _LOCAL_FILE_HANDLERS,
+        _GCS_DOWNLOAD_THREAD_COUNT,
+    )
+  if instance[predictor_const.INPUT_TYPE] == predictor_const.IMAGE_TYPE_DICOM:
+    # decode dicom path
+    # determine dicom source type may query dicom store for series
+    # instance metadata.
+    dicom_record = instance[predictor_const.IMAGE_TYPE_DICOM]
+    auth = authentication_utils.create_auth_from_instance(
+        dicom_record.get(predictor_const.BEARER_TOKEN, '')
+    )
+    result = dicom_source_utils.get_dicom_source_type(auth, dicom_record)
+    # if slide microscope image
+    if (
+        result.dicom_source_type
+        == dicom_source_utils.DicomDataSourceEnum.SLIDE_MICROSCOPY_IMAGE
+    ):
+      # Define pathology DICOM input.
+      parsed_instance = (
+          dicom_wsi_data_accessor_definition.json_to_dicom_wsi_image(
+              auth,
+              dicom_record,
+              config,
+              result.dicom_instances_metadata,
+          )
+      )
+      return dicom_wsi_data_accessor.DicomDigitalPathologyData(
+          parsed_instance, config
+      )
+    parsed_instance = (
+        dicom_generic_data_accessor_definition.json_to_generic_dicom_image(
+            auth,
+            dicom_record,
+            config.endpoint_input_width,
+            config.endpoint_input_height,
+            False,  # Require patch dim match default dim.
+            result.dicom_instances_metadata,
+        )
+    )
+    return dicom_generic_data_accessor.DicomGenericData(parsed_instance)
+  raise data_accessor_errors.InvalidRequestFieldError(
+      'Unsupported image instance input type.'
+  )
+
+
+def _base64_encode_image_bytes(image_bytes: bytes) -> str:
+  """Mockable target for testing."""
+  return base64.b64encode(image_bytes).decode('utf-8')
+
+
+def _zero_pad_image_to_square(norm_img: np.ndarray) -> np.ndarray:
+  """Pads image with zeros to be dimensionally square."""
+  height, width = norm_img.shape[:2]
+  if height < width:
+    dh = width - height
+    half_dh = dh // 2
+    return np.pad(norm_img, ((half_dh, dh - half_dh), (0, 0), (0, 0)))
+  elif width < height:
+    dw = height - width
+    half_dw = dw // 2
+    return np.pad(norm_img, ((0, 0), (half_dw, dw - half_dw), (0, 0)))
+  return norm_img
+
+
+def _compress_image(image_bytes: np.ndarray) -> bytes:
+  """Convert image bytes to compressed image and return compressed bytes."""
+  compression_format = flags.IMAGE_INPUT_COMPRESSION_FORMAT_FLAG.value.lower()
+  if 'jpeg' in compression_format or 'jpg' in compression_format:
+    quality = max(
+        1, min(100, flags.IMAGE_INPUT_JPEG_COMPRESSION_QUALITY_FLAG.value)
+    )
+    return cv2.imencode(
+        '.jpeg', image_bytes, [int(cv2.IMWRITE_JPEG_QUALITY), quality]
+    )[1].tobytes()
+  if 'png' in compression_format:
+    return cv2.imencode('.png', image_bytes)[1].tobytes()
+  raise data_accessor_errors.InternalError(
+      f'Unsupported compression flag: {compression_format}'
+  )
+
+
+def _encode_image_bytes(image_bytes: np.ndarray) -> str:
+  """Encodes uncompressed image bytes as a base64 string."""
+  # convert to 8 bit image
+  if image_bytes.dtype != np.uint8:
+    sf = np.iinfo(image_bytes.dtype).max / np.iinfo(np.uint8).max
+    image_bytes = image_bytes.astype(np.float64) / sf
+    image_bytes = np.round(image_bytes, 0).astype(np.uint8)
+  if image_bytes.shape[-1] == 1 and image_bytes.ndim == 3:
+    # if single channel monochrome image, represent as 3 channel image.
+    image_bytes = np.concatenate(
+        [image_bytes, image_bytes, image_bytes], axis=-1
+    )
+  elif image_bytes.shape[-1] == 4 and image_bytes.ndim == 3:
+    # if RGBA image remove alpha channel.
+    image_bytes = image_bytes[..., :3]
+  elif image_bytes.ndim == 2:
+    image_bytes = np.stack([image_bytes, image_bytes, image_bytes], axis=-1)
+  image_shape = image_bytes.shape[:2]
+  if flags.IMAGE_SIZE_OPTIMIZEATION_FLAG.value and (
+      image_shape[0] > flags.MODEL_INPUT_HEIGHT_FLAG.value
+      or image_shape[1] > flags.MODEL_INPUT_WIDTH_FLAG.value
+  ):
+    # Optional optimization if image size does exceed model input size then
+    # shrink dim of the image to match the model encoder input size. The
+    # optimization reduces the size of the image sent to the model encoder.
+    # For imaging that exceeds the models input size, the optimization will
+    # reduce memory and compute costs associated with execution.
+    width = min(image_shape[1], flags.MODEL_INPUT_WIDTH_FLAG.value)
+    height = min(image_shape[0], flags.MODEL_INPUT_HEIGHT_FLAG.value)
+    # Interarea interpolation is done for decimation. Algorithm is fast
+    # and resistant to high freq noise.
+    image_bytes = cv2.resize(
+        image_bytes, (width, height), interpolation=cv2.INTER_AREA
+    )
+
+  # pad image with zeros to be dimensionally square
+  # method performed in training
+  image_bytes = _zero_pad_image_to_square(image_bytes)
+
+  # opencv assumes BGR ordering.
+  image_bytes = cv2.cvtColor(image_bytes, cv2.COLOR_RGB2BGR)
+  image_bytes = _compress_image(image_bytes)
+  return _base64_encode_image_bytes(image_bytes)
+
+
+@dataclasses.dataclass(frozen=True)
+class _MedGemmaContent:
+  """MedGemma content."""
+
+  input_type: str
+  content: abstract_data_accessor.AbstractDataAccessor[
+      _EmbeddingInstance, Union[np.ndarray, str]
+  ]
+
+  def __post_init__(self):
+    if self.content is None:
+      raise ValueError('MedGemmaContent content is None.')
+
+  @property
+  def med_gemma_content_input(self) -> Sequence[np.ndarray]:
+    """MedGemma content formatted input."""
+    if isinstance(self.content, inline_text_data_accessor.InlineText):
+      # TODO: Clean up
+      raise NotImplementedError('Text input is not treated as content.')
+    return [typing.cast(np.ndarray, i) for i in self.content.data_iterator()]
+
+
+@dataclasses.dataclass(frozen=True)
+class _MedGemmaMessage:
+  role: str
+  content: Sequence[_MedGemmaContent]
+
+  @property
+  def med_gemma_message_input(self) -> str:
+    content_list = []
+    for c in self.content:
+      content_list.extend(c.med_gemma_content_input)
+    return json.dumps({'role': self.role, 'content': content_list})
+
+
+def _parse_text_content(
+    content: Mapping[str, Any],
+) -> abstract_data_accessor.AbstractDataAccessor[_InlineTextInstance, str]:
+  inline_text = inline_text_data_accessor_definition.json_to_text(content)
+  parsed_instance = _InlineTextInstance(
+      text=inline_text.text, base_request=inline_text.base_request
+  )
+  return typing.cast(
+      abstract_data_accessor.AbstractDataAccessor[_InlineTextInstance, str],
+      inline_text_data_accessor.InlineText(parsed_instance),
+  )
+
+
+def _parse_content(
+    config: dicom_wsi_configuration.ConfigurationSettings,
+    content_list: Sequence[Mapping[str, Any]],
+) -> Sequence[_MedGemmaContent]:
+  """Parses content from json and sets up data accessors."""
+  parsed_content = []
+  for content in content_list:
+    json_validation_utils.validate_str_key_dict(content)
+    input_type = json_validation_utils.validate_str(
+        content.get(predictor_const.TYPE)
+    )
+    match input_type:
+      case input_type if input_type in predictor_const.IMAGE_INPUT_TYPES:
+        parsed_content.append(
+            _MedGemmaContent(input_type, _parse_image_content(config, content))
+        )
+      case predictor_const.TEXT_INPUT_TYPE:
+        pass  # no handling needed.
+      case _:
+        raise data_accessor_errors.InvalidRequestFieldError(
+            f'Invalid content input type: {input_type}'
+        )
+  return parsed_content
+
+
+def _parse_all_content(
+    config: dicom_wsi_configuration.ConfigurationSettings,
+    json_messages: Sequence[Mapping[str, Any]],
+) -> Sequence[_MedGemmaContent]:
+  """Parses medgemma messages from json."""
+  contents = []
+  for message in json_messages:
+    json_validation_utils.validate_str_key_dict(message)
+    if isinstance(message.get(predictor_const.CONTENT), str):
+      continue
+    content = json_validation_utils.validate_not_empty_list(
+        message.get(predictor_const.CONTENT)
+    )
+    contents.extend(_parse_content(config, content))
+  return contents
+
+
+@dataclasses.dataclass(frozen=True)
+class _MedGemmaPredictionParameters:
+  """Model request parameters."""
+
+  max_tokens: Optional[int] = None
+  temperature: Optional[int] = None
+  frequency_penalty: Optional[float] = None
+  n: Optional[int] = None
+  presence_penalty: Optional[float] = None
+  seed: Optional[int] = None
+  stop: Optional[str] = None
+  top_p: Optional[float] = None
+  best_of: Optional[int] = None
+  top_k: Optional[int] = None
+  min_p: Optional[float] = None
+  repetition_penalty: Optional[float] = None
+  include_stop_str_in_output: Optional[bool] = None
+  ignore_eos: Optional[bool] = None
+  min_tokens: Optional[int] = None
+  skip_special_tokens: Optional[bool] = None
+  truncate_prompt_tokens: Optional[bool] = None
+  spaces_between_special_tokens: Optional[bool] = None
+
+  @classmethod
+  def from_json(
+      cls, json_parameters: Mapping[str, Any]
+  ) -> '_MedGemmaPredictionParameters':
+    """Extracts parameters from json and incorporates defaults."""
+    name_map = {
+        'max_tokens': 'max_tokens',
+        'max_completion_tokens': 'max_tokens',
+        'temperature': 'temperature',
+        'frequency_penalty': 'frequency_penalty',
+        'n': 'n',
+        'presence_penalty': 'presence_penalty',
+        'seed': 'seed',
+        'stop': 'stop',
+        'top_p': 'top_p',
+        'best_of': 'best_of',
+        'top_k': 'top_k',
+        'min_p': 'min_p',
+        'repetition_penalty': 'repetition_penalty',
+        'include_stop_str_in_output': 'include_stop_str_in_output',
+        'ignore_eos': 'ignore_eos',
+        'min_tokens': 'min_tokens',
+        'skip_special_tokens': 'skip_special_tokens',
+        'truncate_prompt_tokens': 'truncate_prompt_tokens',
+        'spaces_between_special_tokens': 'spaces_between_special_tokens',
+    }
+    default_parameters = {
+        'max_tokens': _DEFAULT_MAX_TOKENS,
+    }
+    mapped_parameters = {
+        name_map[k]: v for k, v in json_parameters.items() if k in name_map
+    }
+    return cls(**(default_parameters | mapped_parameters))
+
+  def to_dict(self) -> Mapping[str, Any]:
+    return {
+        key: value
+        for key, value in dataclasses.asdict(self).items()
+        if value is not None
+    }
+
+
+@dataclasses.dataclass(frozen=True)
+class _MedGemmaPredictionRequest:
+  """MedGemma model input."""
+
+  prompt: str
+  content: Sequence[_MedGemmaContent]
+  parameters: _MedGemmaPredictionParameters
+
+  @property
+  def model_input(self) -> Mapping[str, np.ndarray]:
+    """Model input for prediction."""
+    images = []
+    for c in self.content:
+      images.extend(c.med_gemma_content_input)
+    input_map = {
+        'text_input': np.array([self.prompt.encode('utf-8')], dtype=np.object_),
+        'exclude_input_in_output': np.ndarray([1], dtype=np.bool_),
+        'return_num_input_tokens': np.ndarray([1], dtype=np.bool_),
+        'return_num_output_tokens': np.ndarray([1], dtype=np.bool_),
+    }
+    if images:
+      input_map['image'] = np.array(
+          [_encode_image_bytes(image).encode('utf-8') for image in images],
+          dtype=np.object_,
+      )
+    return input_map
+
+
+class _PredictionInputParser:
+  """Class containing methods for transforming embedding request and responses."""
+
+  def __init__(
+      self,
+      prompt_converter: Callable[[list[dict[str, Any]], dict[str, Any]], str],
+  ):
+    self._prompt_converter = prompt_converter
+
+  def json_to_embedding_request(
+      self,
+      config: dicom_wsi_configuration.ConfigurationSettings,
+      json_metadata: Mapping[str, Any],
+  ) -> _MedGemmaPredictionRequest:
+    """Converts json to embedding request.
+
+    Args:
+      config: The configuration settings for the data source.
+      json_metadata: The value of the JSON payload provided to the API.
+
+    Returns:
+      Structured EmbeddingRequest object.
+
+    Raises:
+      InvalidRequestFieldError: If the provided fields are invalid.
+    """
+    json_validation_utils.validate_str_key_dict(json_metadata)
+    try:
+      parameters = _MedGemmaPredictionParameters.from_json(json_metadata)
+      messages = json_validation_utils.validate_list(
+          json_metadata.get('messages', None)
+      )
+      content = _parse_all_content(config, messages)
+      prompt = self._prompt_converter(
+          messages,
+          {
+              'add_generation_prompt': json_metadata.get(
+                  'add_generation_prompt', True
+              )
+          },
+      )
+    except json_validation_utils.ValidationError as e:
+      raise data_accessor_errors.InvalidRequestFieldError(
+          f'Invalid request field: {e}'
+      ) from e
+    return _MedGemmaPredictionRequest(prompt, content, parameters)
+
+
+def _validate_instance_list(json_metadata: Mapping[str, Any]) -> Sequence[Any]:
+  if not isinstance(json_metadata, dict):
+    raise data_accessor_errors.InvalidRequestFieldError(
+        'Request is not a dict.'
+    )
+  val = json_metadata.get(predictor_const.INSTANCES)
+  if isinstance(val, list):
+    return val
+  raise data_accessor_errors.InvalidRequestFieldError(
+      'Invalid input, missing expected'
+      f' key: {predictor_const.INSTANCES} and associated list of values.'
+  )
+
+
+def _get_inst_data_map_func(
+    context: contextlib.ExitStack,
+    med_gemma_content: _MedGemmaContent,
+) -> Optional[data_accessor_errors.DataAccessorError]:
+  """Returns retrieved data or exception."""
+  try:
+    med_gemma_content.content.load_data(context)
+    return None
+  except data_accessor_errors.DataAccessorError as exp:
+    return exp
+
+
+@dataclasses.dataclass(frozen=True)
+class _MedGemmaPredictionResults:
+  """Model response."""
+
+  text_output: tuple[str, ...]
+  num_input_tokens: int
+  num_output_tokens: tuple[int, ...]
+
+
+class _ModelPredictor:
+  """Retrieves data and runs data across model predictor."""
+
+  def __init__(
+      self,
+      *,
+      prompt_converter: Callable[[list[dict[str, Any]], dict[str, Any]], str],
+  ):
+    self._threadpool_max_workers = max(
+        flags.THREAD_POOL_MAX_WORKERS_FLAG.value, 1
+    )
+    self._thread_pool_timeout = flags.THREAD_POOL_TIMEOUT_FLAG.value
+    self._prompt_converter = prompt_converter
+
+  def _prefetch_instance_data_async(
+      self,
+      stack: contextlib.ExitStack,
+      med_gemma_content: Sequence[_MedGemmaContent],
+  ) -> Sequence[data_accessor_errors.DataAccessorError]:
+    """Calls function in parallel to init each instance."""
+    if not med_gemma_content:
+      return []
+    if len(med_gemma_content) == 1:
+      result = _get_inst_data_map_func(stack, med_gemma_content[0])
+      return [] if result is None else [result]
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=self._threadpool_max_workers,
+    ) as thread_pool:
+      results = list(
+          thread_pool.map(
+              functools.partial(_get_inst_data_map_func, stack),
+              med_gemma_content,
+              timeout=self._thread_pool_timeout,
+          )
+      )
+    return [r for r in results if r is not None]
+
+  def predict_request(
+      self,
+      model: model_runner.ModelRunner,
+      request: _MedGemmaPredictionRequest,
+  ) -> Union[
+      _MedGemmaPredictionResults,
+      Sequence[data_accessor_errors.DataAccessorError],
+  ]:
+    """Get imaging in parallel and then run ML model once."""
+    start_time = time.time()
+    # create a list of all content required for inference request.
+    content_list = request.content
+    with contextlib.ExitStack() as stack:
+      errors_loading_data = self._prefetch_instance_data_async(
+          stack, content_list
+      )
+      if errors_loading_data:
+        return errors_loading_data
+      # generate text input from med gemma prediction.
+      # model execution parameters
+      # call medgemma and return response.
+      result = model.run_model_multiple_output(
+          model_input=request.model_input,
+          parameters=request.parameters.to_dict(),
+          model_output_keys={
+              'text_output',
+              'num_input_tokens',
+              'num_output_tokens',
+          },
+      )
+
+    cloud_logging_client.info(
+        f'Called embedding model; {time.time() - start_time} (sec).'
+    )
+    # text_output is a ndarray containing byte-encoded strings.
+    return _MedGemmaPredictionResults(
+        tuple([
+            text_output.decode('utf-8') for text_output in result['text_output']
+        ]),
+        int(result['num_input_tokens']),
+        tuple(result['num_output_tokens'].ravel().tolist()),
+    )
+
+
+def _instance_response(
+    result: _MedGemmaPredictionResults,
+) -> Mapping[str, Any]:
+  """Returns a JSON-serializable embedding instance responses."""
+  choices = []
+  for index, text_output in enumerate(result.text_output):
+    choices.append({
+        'index': index,
+        'message': {'content': text_output, 'role': 'assistant'},
+    })
+  completion_tokens = sum(result.num_output_tokens)
+  return {
+      'id': str(uuid.uuid4()),
+      'object': 'chat.completion',
+      'created': int(time.time()),
+      'choices': choices,
+      'usage': {
+          'prompt_tokens': result.num_input_tokens,
+          'completion_tokens': completion_tokens,
+          'total_tokens': result.num_input_tokens + completion_tokens,
+      },
+      'model': 'placeholder',
+  }
+
+
+def _prediction_error_response(
+    ds_error: data_accessor_errors.DataAccessorError,
+) -> Mapping[str, Any]:
+  error = {
+      'message': ds_error.api_description[:_MAX_ERROR_DESCRIPTION_LENGTH],
+      'object': predictor_const.ERROR,
+      # 'type': ds_error.error_code.category,
+  }
+  return {predictor_const.ERROR: error}
+
+
+class MedGemmaPredictor:
+  """Callable responsible for generating embeddings."""
+
+  def __init__(
+      self,
+      *,
+      prompt_converter: Callable[[list[dict[str, Any]], dict[str, Any]], str],
+      instance_validator: jsonschema.Draft202012Validator | None = None
+  ):
+    self._prompt_converter = prompt_converter
+    self._instance_validator = instance_validator
+
+  def _single_predict(
+      self,
+      prediction_input: Mapping[str, Any],
+      model: model_runner.ModelRunner,
+  ) -> dict[str, Any]:
+    """Runs chat completion on the provided conversation.
+
+    Args:
+      prediction_input: JSON formatted input for embedding prediction.
+      model: ModelRunner to handle model step.
+
+    Returns:
+      JSON formatted output.
+
+    Raises:
+      ERROR_LOADING_DICOM: If the provided patches are not concated.
+    """
+    config = dicom_wsi_configuration.ConfigurationSettings(
+        endpoint_input_width=flags.MODEL_INPUT_WIDTH_FLAG.value,
+        endpoint_input_height=flags.MODEL_INPUT_HEIGHT_FLAG.value,
+        approved_dicom_stores=flags.APPROVED_DICOM_STORE_SOURCE_LIST_FLAG.value,
+        icc_profile_cache_configuration=dicom_wsi_configuration.IccProfileCacheConfiguration(
+            gcs_bucket=flags.ICC_PROFILE_CACHE_GCS_BUCKET_FLAG.value,
+            redis_ip=flags.ICC_PROFILE_CACHE_REDIS_IP_FLAG.value,
+            redis_port=flags.ICC_PROFILE_CACHE_REDIS_PORT_FLAG.value,
+            store_icc_profile_bytes_in_redis=flags.STORE_ICC_PROFILE_BYTES_IN_REDIS_FLAG.value,
+            testing=flags.IS_DEBUGGING_FLAG.value,
+        ),
+    )
+    try:
+      med_gemma_predictionrequest = _PredictionInputParser(
+          self._prompt_converter
+      ).json_to_embedding_request(config, prediction_input)
+    except data_accessor_errors.DataAccessorError as exp:
+      return dict(_prediction_error_response(exp))
+
+    predictor = _ModelPredictor(prompt_converter=self._prompt_converter)
+    try:
+      result = predictor.predict_request(model, med_gemma_predictionrequest)
+      if isinstance(result, _MedGemmaPredictionResults):
+        return dict(_instance_response(result))
+      # Error handling only from here on.
+    except data_accessor_errors.DataAccessorError as exp:
+      return dict(_prediction_error_response(exp))
+    try:
+      result = result[0]
+    except IndexError:
+      result = data_accessor_errors.InternalError('Invalided model response')
+    cloud_logging_client.info('Returning embeddings.')
+    return dict(_prediction_error_response(result))
+
+  def predict(
+      self,
+      prediction_input: Mapping[str, Any],
+      model: model_runner.ModelRunner,
+  ) -> dict[str, Any]:
+    """Runs chat completion on a request."""
+
+    # Sort out whether this is a singular request or multiple instances.
+    if INSTANCES_KEY in prediction_input:
+      if len(prediction_input[INSTANCES_KEY]) == 1:
+        try:
+          if self._instance_validator is not None:
+            self._instance_validator.validate(
+                prediction_input[INSTANCES_KEY][0]
+            )
+        except jsonschema.exceptions.ValidationError as e:
+          cloud_logging_client.warning("Input validation failed")
+          return {"error": str(e)}
+        return {
+            PREDICTIONS_KEY: self._single_predict(
+                prediction_input[INSTANCES_KEY][0], model
+            )
+        }
+      try:
+        if self._instance_validator is not None:
+          for instance in prediction_input[INSTANCES_KEY]:
+            self._instance_validator.validate(instance)
+      except jsonschema.exceptions.ValidationError as e:
+        cloud_logging_client.warning("Input validation failed")
+        return {"error": str(e)}
+      predictions = [
+          self._single_predict(instance, model)
+          for instance in prediction_input[INSTANCES_KEY]
+      ]
+      return {PREDICTIONS_KEY: predictions}
+
+    try:
+      if self._instance_validator is not None:
+        self._instance_validator.validate(prediction_input)
+    except jsonschema.exceptions.ValidationError as e:
+      cloud_logging_client.warning("Input validation failed")
+      return {"error": str(e)}
+    return self._single_predict(prediction_input, model)
