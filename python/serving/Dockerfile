@@ -20,8 +20,8 @@ FROM python:3.12-slim AS prep
 WORKDIR /payload
 
 # Get pip requirements
-COPY requirements.txt /payload/requirements.txt
-COPY serving_framework/pip-install.txt /payload/pip-install.txt
+COPY ./python/serving/requirements.txt /payload/requirements.txt
+COPY ./python/serving/serving_framework/pip-install.txt /payload/pip-install.txt
 RUN python3.12 -m venv --copies /payload/server-env && \
     /payload/server-env/bin/python3.12 -m pip install --require-hashes \
         -r pip-install.txt && \
