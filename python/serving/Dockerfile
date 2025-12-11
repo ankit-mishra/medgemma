@@ -17,13 +17,11 @@
 
 FROM python:3.12-slim AS prep
 
-RUN pwd
-WORKDIR ../..
-RUN pwd
+WORKDIR /payload
 
 # Get pip requirements
-COPY ./python/serving/requirements.txt requirements.txt
-COPY ./python/serving/serving_framework/pip-install.txt pip-install.txt
+COPY requirements.txt /payload/requirements.txt
+COPY serving_framework/pip-install.txt /payload/pip-install.txt
 RUN python3.12 -m venv --copies /payload/server-env && \
     /payload/server-env/bin/python3.12 -m pip install --require-hashes \
         -r pip-install.txt && \
