@@ -4,7 +4,7 @@ steps:
     - 'build'
     - '-t'
     - 'gcr.io/${PROJECT_ID}/medgemma-serving:${COMMIT_SHA}'
-    - '-t'
+    - '-f'
     - './python/serving/Dockerfile'
     - '.'
   id: 'Build Docker Image'
