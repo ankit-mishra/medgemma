@@ -17,6 +17,7 @@
 
 FROM python:3.12-slim AS prep
 
+WORKDIR ../..
 # Get pip requirements
 COPY ./python/serving/requirements.txt requirements.txt
 COPY ./python/serving/serving_framework/pip-install.txt pip-install.txt
