@@ -4,7 +4,7 @@ steps:
   args:
     - '-c'
     - |
-      docker pull us-docker.pkg.dev/vertex-ai/prediction/pytorch-gpu.2-3.py310:latest
+      docker pull us-docker.pkg.dev/deeplearning-platform-release/gcr.io/pytorch-gpu.2-2.py310.cu118:latest
   id: 'Pull Docker Image'
 
 serviceAccount: 'projects/novofoundation-itpr10996/serviceAccounts/novo-foundation-saaccount@novofoundation-itpr10996.iam.gserviceaccount.com'
